@@ -105,5 +105,8 @@ func main() {
 			}
 		}
 	}
+	for _, shard := range shardFiles {
+		shard.Flush()
+	}
 	fmt.Printf("Finished // countWritten:%d countTotal:%d\n", countWritten, countTotal)
 }
