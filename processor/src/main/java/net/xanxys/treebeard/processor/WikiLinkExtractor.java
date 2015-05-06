@@ -13,96 +13,17 @@ import com.google.cloud.dataflow.sdk.transforms.Aggregator;
 import com.google.cloud.dataflow.sdk.transforms.DoFn;
 import com.google.cloud.dataflow.sdk.transforms.ParDo;
 import com.google.cloud.dataflow.sdk.transforms.Sum;
+import com.google.cloud.dataflow.sdk.transforms.join.CoGbkResult;
+import com.google.cloud.dataflow.sdk.transforms.join.CoGroupByKey;
+import com.google.cloud.dataflow.sdk.transforms.join.KeyedPCollectionTuple;
+import com.google.cloud.dataflow.sdk.values.KV;
+import com.google.cloud.dataflow.sdk.values.PCollection;
+import com.google.cloud.dataflow.sdk.values.TupleTag;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public class WikiLinkExtractor {
-    static class ExtractLinksFn extends DoFn<TableRow, TableRow> {
-        private static final long serialVersionUID = 0;
-        private static final String redirectTag = "#REDIRECT";
-        private Pattern linkRegex;
-        private Aggregator<Long> countSpecialNamespace;
-        private Aggregator<Long> countMisplacedRedirect;
-        private Aggregator<Long> countMultiRedirect;
-
-        @Override
-        public void startBundle(Context c) throws Exception {
-            super.startBundle(c);
-            linkRegex = Pattern.compile("\\[\\[(\\S+)\\]\\]");
-
-            countSpecialNamespace = c.createAggregator("special_namespace", new Sum.SumLongFn());
-            countMisplacedRedirect = c.createAggregator("misplaced_redirect", new Sum.SumLongFn());
-            countMultiRedirect = c.createAggregator("multi_redirect", new Sum.SumLongFn());
-        }
-
-        @Override
-        public void processElement(ProcessContext c) {
-            final String aid = (String) c.element().get("ArticleId");
-            final String text = (String) c.element().get("Text");
-
-            final boolean isRedirect = text.trim().startsWith(redirectTag);
-            final boolean containRedirect = text.contains(redirectTag);
-
-            // Ignore strange (not starting with #REDIRECT) redirect pages altogether.
-            if(!isRedirect && containRedirect) {
-                countMisplacedRedirect.addValue(1L);
-                return;
-            }
-
-            // Extract links.
-            final Matcher matcher = linkRegex.matcher(text);
-            final ArrayList<TableRow> links = new ArrayList<>();
-            while (matcher.find()) {
-                final String linkText = matcher.group(1);
-                final int indexBar = linkText.indexOf('|');
-
-                // Extract a proper article title and an optional human-friendly label to it.
-                // linkText is either "Title|Label" or "Title"
-                String linkTitle;
-                String linkLabel;
-                if(indexBar >= 0) {
-                    linkTitle = linkText.substring(0, indexBar);
-                    linkLabel = linkText.substring(indexBar + 1, linkText.length());
-                } else {
-                    linkTitle = linkText;
-                    linkLabel = linkText;
-                }
-
-                // Title can contain anchors, e.g. "Something#SomeSection".
-                // Remove the sharp and the anchor.
-                final int indexAnchor = linkTitle.indexOf('#');
-                if(indexAnchor >= 0) {
-                    linkTitle = linkTitle.substring(0, indexAnchor);
-                }
-
-                // Omit special namespaces. (e.g. "Wikipedia:BlahBlah", "User:Foo", etc.)
-                if(linkTitle.indexOf(':') >= 0) {
-                    countSpecialNamespace.addValue(1L);
-                    continue;
-                }
-                links.add(new TableRow()
-                        .set("article_id", aid)
-                        .set("link_title", linkTitle)
-                        .set("link_label", linkLabel)
-                        .set("redirect", isRedirect));
-            }
-
-            // Reject ambiguous redirects.
-            if(isRedirect && links.size() != 1) {
-                countMultiRedirect.addValue(1L);
-                return;
-            }
-
-
-            for(TableRow link : links) {
-                c.output(link);
-            }
-        }
-    }
-
     /**
      * Options supported by {@link WikiLinkExtractor}.
      * <p>
@@ -126,23 +47,80 @@ public class WikiLinkExtractor {
         final Options options = PipelineOptionsFactory.fromArgs(args).withValidation().as(Options.class);
         final Pipeline extractor = Pipeline.create(options);
 
+        final PCollection<TableRow> articles = extractor
+                .apply(BigQueryIO.Read.named("WikiArticles").from(options.getInput()));
+        final PCollection<TableRow> links = articles.apply(ParDo.of(new ExtractLinksFn()));
+
+        // Resolve link title by joining with articles. (use title as keys)
+        // Output links with article_id_dst attached.
+        final TupleTag<String> tagArticle = new TupleTag<>();
+        final TupleTag<TableRow> tagLink = new TupleTag<>();
+
+        final PCollection<TableRow> resolvedLinks =
+                KeyedPCollectionTuple
+                        .of(tagArticle,
+                                articles.apply(ParDo.of(new DoFn<TableRow, KV<String, String>>() {
+                                    @Override
+                                    public void processElement(ProcessContext c) throws Exception {
+                                        c.output(KV.of((String) c.element().get("Title"), (String) c.element().get("ArticleId")));
+                                    }
+                                })))
+                        .and(tagLink,
+                                links.apply(ParDo.of(new DoFn<TableRow, KV<String, TableRow>>() {
+                                    @Override
+                                    public void processElement(ProcessContext c) throws Exception {
+                                        c.output(KV.of((String) c.element().get("link_title"), c.element()));
+                                    }
+                                })))
+                        .apply(CoGroupByKey.<String>create())
+                        .apply(ParDo.of(new DoFn<KV<String, CoGbkResult>, TableRow>() {
+                            private Aggregator<Long> countLinkTitleNotFound;
+                            private Aggregator<Long> countLinkTitleAmbiguous;
+
+                            @Override
+                            public void startBundle(Context c) throws Exception {
+                                super.startBundle(c);
+                                countLinkTitleNotFound = c.createAggregator("link_title_not_found", new Sum.SumLongFn());
+                                countLinkTitleAmbiguous = c.createAggregator("link_title_ambiguous", new Sum.SumLongFn());
+                            }
+
+                            @Override
+                            public void processElement(ProcessContext c) throws Exception {
+                                final KV<String, CoGbkResult> kv = c.element();
+
+                                final ArrayList<String> ids = new ArrayList<String>();
+                                for(String id : kv.getValue().getAll(tagArticle)) {
+                                    ids.add(id);
+                                }
+                                for (TableRow link : kv.getValue().getAll(tagLink)) {
+                                    if (ids.size() == 0) {
+                                        countLinkTitleNotFound.addValue(1L);
+                                    } else {
+                                        link.set("article_id_dst", ids.get(0));
+                                        if (ids.size() > 1) {
+                                            countLinkTitleAmbiguous.addValue(1L);
+                                        }
+                                        c.output(link);
+                                    }
+                                }
+                            }
+                        }));
+
         // Prepare output schema.
         final List<TableFieldSchema> fields = new ArrayList<>();
-        fields.add(new TableFieldSchema().setName("article_id").setType("STRING"));
+        fields.add(new TableFieldSchema().setName("article_id_src").setType("STRING"));
+        fields.add(new TableFieldSchema().setName("article_id_dst").setType("STRING"));
         fields.add(new TableFieldSchema().setName("link_label").setType("STRING"));
         fields.add(new TableFieldSchema().setName("link_title").setType("STRING"));
         fields.add(new TableFieldSchema().setName("redirect").setType("BOOLEAN"));
         final TableSchema schema = new TableSchema().setFields(fields);
 
-        extractor
-                .apply(BigQueryIO.Read.named("WikiArticles").from(options.getInput()))
-                .apply(ParDo.of(new ExtractLinksFn()))
-                .apply(BigQueryIO.Write
-                        .named("WriteLinks")
-                        .to(options.getOutput())
-                        .withSchema(schema)
-                        .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_TRUNCATE)
-                        .withCreateDisposition(BigQueryIO.Write.CreateDisposition.CREATE_IF_NEEDED));
+        resolvedLinks.apply(BigQueryIO.Write
+                .named("WriteLinks")
+                .to(options.getOutput())
+                .withSchema(schema)
+                .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_TRUNCATE)
+                .withCreateDisposition(BigQueryIO.Write.CreateDisposition.CREATE_IF_NEEDED));
         extractor.run();
     }
 
