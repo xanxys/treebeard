@@ -22,8 +22,11 @@ import java.util.regex.Pattern;
 public class WikiLinkExtractor {
     static class ExtractLinksFn extends DoFn<TableRow, TableRow> {
         private static final long serialVersionUID = 0;
+        private static final String redirectTag = "#REDIRECT";
         private Pattern linkRegex;
         private Aggregator<Long> countSpecialNamespace;
+        private Aggregator<Long> countMisplacedRedirect;
+        private Aggregator<Long> countMultiRedirect;
 
         @Override
         public void startBundle(Context c) throws Exception {
@@ -31,6 +34,8 @@ public class WikiLinkExtractor {
             linkRegex = Pattern.compile("\\[\\[(\\S+)\\]\\]");
 
             countSpecialNamespace = c.createAggregator("special_namespace", new Sum.SumLongFn());
+            countMisplacedRedirect = c.createAggregator("misplaced_redirect", new Sum.SumLongFn());
+            countMultiRedirect = c.createAggregator("multi_redirect", new Sum.SumLongFn());
         }
 
         @Override
@@ -38,8 +43,18 @@ public class WikiLinkExtractor {
             final String aid = (String) c.element().get("ArticleId");
             final String text = (String) c.element().get("Text");
 
-            final Matcher matcher = linkRegex.matcher(text);
+            final boolean isRedirect = text.trim().startsWith(redirectTag);
+            final boolean containRedirect = text.contains(redirectTag);
 
+            // Ignore strange (not starting with #REDIRECT) redirect pages altogether.
+            if(!isRedirect && containRedirect) {
+                countMisplacedRedirect.addValue(1L);
+                return;
+            }
+
+            // Extract links.
+            final Matcher matcher = linkRegex.matcher(text);
+            final ArrayList<TableRow> links = new ArrayList<>();
             while (matcher.find()) {
                 final String linkText = matcher.group(1);
                 final int indexBar = linkText.indexOf('|');
@@ -68,10 +83,22 @@ public class WikiLinkExtractor {
                     countSpecialNamespace.addValue(1L);
                     continue;
                 }
-                c.output(new TableRow()
+                links.add(new TableRow()
                         .set("article_id", aid)
                         .set("link_title", linkTitle)
-                        .set("link_label", linkLabel));
+                        .set("link_label", linkLabel)
+                        .set("redirect", isRedirect));
+            }
+
+            // Reject ambiguous redirects.
+            if(isRedirect && links.size() != 1) {
+                countMultiRedirect.addValue(1L);
+                return;
+            }
+
+
+            for(TableRow link : links) {
+                c.output(link);
             }
         }
     }
@@ -104,6 +131,7 @@ public class WikiLinkExtractor {
         fields.add(new TableFieldSchema().setName("article_id").setType("STRING"));
         fields.add(new TableFieldSchema().setName("link_label").setType("STRING"));
         fields.add(new TableFieldSchema().setName("link_title").setType("STRING"));
+        fields.add(new TableFieldSchema().setName("redirect").setType("BOOLEAN"));
         final TableSchema schema = new TableSchema().setFields(fields);
 
         extractor
